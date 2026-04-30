@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --group dev
+      - run: uv run ruff check tools/ tests/
+      - run: uv run ruff format --check tools/ tests/
+      - run: uv run mypy tools/ tests/
+      - run: uv run pytest
+
+  go:
+    runs-on: ubuntu-latest
+    if: >-
+      contains(toJSON(github.event.commits.*.modified), '.go') ||
+      contains(toJSON(github.event.commits.*.added), '.go') ||
+      contains(toJSON(github.event.commits.*.modified), 'go.mod')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test ./...

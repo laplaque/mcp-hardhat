@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+uv.lock
+.venv
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Go
+/bin/
+
+# OS
+.DS_Store
