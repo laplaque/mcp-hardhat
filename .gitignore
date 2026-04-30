@@ -10,6 +10,8 @@ uv.lock
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
+.coverage
+htmlcov/
 
 # Go
 /bin/

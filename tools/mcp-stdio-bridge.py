@@ -37,6 +37,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--ca-file", help="CA bundle path (overrides NODE_EXTRA_CA_CERTS)")
     p.add_argument("--bearer-env", metavar="ENV_VAR", help="Env var containing Bearer token for Authorization header")
+    p.add_argument("--timeout", type=float, default=30.0, help="HTTP request timeout in seconds (default: 30)")
+    p.add_argument("--debug", action="store_true", help="Log session changes and retries to stderr")
     return p.parse_args(argv)
 
 
@@ -100,46 +102,149 @@ def write_jsonrpc_error(request_id: object, code: int, message: str) -> None:
     sys.stdout.flush()
 
 
+class BridgeConfig:
+    def __init__(
+        self, url: str, headers: dict[str, str], ctx: ssl.SSLContext, timeout: float, debug: bool = False
+    ) -> None:
+        self.url = url
+        self.headers = headers
+        self.ctx = ctx
+        self.timeout = timeout
+        self.debug = debug
+
+
+class BridgeState:
+    def __init__(self) -> None:
+        self.session_id: str | None = None
+        self.generation: int = 0
+
+    def set_session(self, new_id: str | None, *, debug: bool = False) -> None:
+        if new_id != self.session_id:
+            self.session_id = new_id
+            self.generation += 1
+            if debug:
+                print(
+                    f"mcp-stdio-bridge: session updated generation={self.generation}",
+                    file=sys.stderr,
+                )
+
+    def clear_session(self, *, debug: bool = False) -> None:
+        self.set_session(None, debug=debug)
+
+
+class HttpMcpError(Exception):
+    def __init__(self, status: int, body: str, method: str) -> None:
+        self.status = status
+        self.body = body[:4096]
+        self.method = method
+        super().__init__(f"HTTP {status} on {method}")
+
+
+_STALE_SESSION_TERMS = ("session", "expired", "unknown", "invalid", "not found", "stale", "mcp-session-id")
+
+
+def is_stale_session_failure(err: HttpMcpError, session_was_sent: bool) -> bool:
+    if not session_was_sent:
+        return False
+    if err.method == "initialize":
+        return False
+    if err.status in (401, 403):
+        return False
+    if err.status not in (400, 404):
+        return False
+    body_lower = err.body.strip().lower()
+    if not body_lower:
+        return True
+    return any(term in body_lower for term in _STALE_SESSION_TERMS)
+
+
+def http_post_once(
+    cfg: BridgeConfig,
+    payload: dict[str, object],
+    session_id: str | None,
+) -> tuple[object | None, str | None]:
+    data = json.dumps(payload).encode()
+    req_headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+    req_headers.update(cfg.headers)
+    if session_id:
+        req_headers["Mcp-Session-Id"] = session_id
+    req = urllib.request.Request(cfg.url, data=data, headers=req_headers, method="POST")
+    try:
+        resp = urllib.request.urlopen(req, context=cfg.ctx, timeout=cfg.timeout)  # noqa: S310
+    except urllib.error.HTTPError as e:
+        body_bytes = e.read(4096)
+        body_text = body_bytes.decode("utf-8", errors="replace")
+        method = str(payload.get("method", "unknown"))
+        raise HttpMcpError(e.code, body_text, method) from e
+    resp_session: str | None = resp.headers.get("Mcp-Session-Id")
+    body = resp.read().decode()
+    return parse_sse_or_json(body), resp_session
+
+
+def http_post(
+    cfg: BridgeConfig,
+    payload: dict[str, object],
+    state: BridgeState,
+) -> object | None:
+    method = str(payload.get("method", ""))
+    if method == "initialize":
+        state.clear_session(debug=cfg.debug)
+
+    session_sent = state.session_id is not None
+    try:
+        result, resp_session = http_post_once(cfg, payload, state.session_id)
+        if resp_session:
+            state.set_session(resp_session, debug=cfg.debug)
+        return result
+    except HttpMcpError as err:
+        if not is_stale_session_failure(err, session_sent):
+            raise
+        if cfg.debug:
+            print(
+                f"mcp-stdio-bridge: stale session suspected status={err.status}"
+                f" method={err.method} generation={state.generation}",
+                file=sys.stderr,
+            )
+        state.clear_session(debug=cfg.debug)
+        if cfg.debug:
+            print("mcp-stdio-bridge: cleared session and retrying once", file=sys.stderr)
+        result, resp_session = http_post_once(cfg, payload, None)
+        if resp_session:
+            state.set_session(resp_session, debug=cfg.debug)
+        return result
+
+
 def run(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-    url = args.url
-    extra_headers = resolve_headers(args)
-    ctx = build_ssl_context(args.ca_file)
-    session: str | None = None
-
-    def http_post(payload: dict[str, object]) -> object | None:
-        nonlocal session
-        if payload.get("method") == "initialize":
-            session = None
-        data = json.dumps(payload).encode()
-        headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
-        headers.update(extra_headers)
-        if session:
-            headers["Mcp-Session-Id"] = session
-        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-        resp = urllib.request.urlopen(req, context=ctx)  # noqa: S310
-        if not session:
-            session = resp.headers.get("Mcp-Session-Id")
-        body = resp.read().decode()
-        return parse_sse_or_json(body)
+    cfg = BridgeConfig(
+        url=args.url,
+        headers=resolve_headers(args),
+        ctx=build_ssl_context(args.ca_file),
+        timeout=args.timeout,
+        debug=args.debug,
+    )
+    state = BridgeState()
 
     for raw in sys.stdin:
         raw = raw.strip()
         if not raw:
             continue
         msg: dict[str, object] = json.loads(raw)
-        if "id" not in msg:
+        is_notification = "id" not in msg
+
+        if is_notification:
             try:
-                http_post(msg)
-            except urllib.error.HTTPError as e:
-                print(f"notification forwarding failed: HTTP {e.code}", file=sys.stderr)
+                http_post(cfg, msg, state)
+            except HttpMcpError as e:
+                print(f"notification forwarding failed: HTTP {e.status}", file=sys.stderr)
             except Exception as e:
                 print(f"notification forwarding failed: {type(e).__name__}", file=sys.stderr)
             continue
+
         try:
-            resp = http_post(msg)
-        except urllib.error.HTTPError as e:
-            write_jsonrpc_error(msg["id"], -32000, f"HTTP MCP request failed with status {e.code}")
+            resp = http_post(cfg, msg, state)
+        except HttpMcpError as e:
+            write_jsonrpc_error(msg["id"], -32000, f"HTTP MCP request failed with status {e.status}")
             continue
         except RuntimeError as e:
             write_jsonrpc_error(msg["id"], -32000, f"HTTP MCP request failed: {e}")
