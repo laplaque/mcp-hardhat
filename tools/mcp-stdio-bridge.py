@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import ssl
@@ -39,6 +40,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--bearer-env", metavar="ENV_VAR", help="Env var containing Bearer token for Authorization header")
     p.add_argument("--timeout", type=float, default=30.0, help="HTTP request timeout in seconds (default: 30)")
     p.add_argument("--debug", action="store_true", help="Log session changes and retries to stderr")
+    p.add_argument(
+        "--recover-stale-session",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Silently re-init when server returns -32001 recoverable-session error (default: enabled)",
+    )
     return p.parse_args(argv)
 
 
@@ -104,19 +111,27 @@ def write_jsonrpc_error(request_id: object, code: int, message: str) -> None:
 
 class BridgeConfig:
     def __init__(
-        self, url: str, headers: dict[str, str], ctx: ssl.SSLContext, timeout: float, debug: bool = False
+        self,
+        url: str,
+        headers: dict[str, str],
+        ctx: ssl.SSLContext,
+        timeout: float,
+        debug: bool = False,
+        recover_stale_session: bool = True,
     ) -> None:
         self.url = url
         self.headers = headers
         self.ctx = ctx
         self.timeout = timeout
         self.debug = debug
+        self.recover_stale_session = recover_stale_session
 
 
 class BridgeState:
     def __init__(self) -> None:
         self.session_id: str | None = None
         self.generation: int = 0
+        self.cached_init: dict[str, object] | None = None
 
     def set_session(self, new_id: str | None, *, debug: bool = False) -> None:
         if new_id != self.session_id:
@@ -140,6 +155,12 @@ class HttpMcpError(Exception):
         super().__init__(f"HTTP {status} on {method}")
 
 
+class _RecoveryFailedError(Exception):
+    """Internal: silent re-init flow could not complete."""
+
+
+_SESSION_EXPIRED_CODE = -32001
+
 _STALE_SESSION_TERMS = ("session", "expired", "unknown", "invalid", "not found", "stale", "mcp-session-id")
 
 
@@ -156,6 +177,19 @@ def is_stale_session_failure(err: HttpMcpError, session_was_sent: bool) -> bool:
     if not body_lower:
         return True
     return any(term in body_lower for term in _STALE_SESSION_TERMS)
+
+
+def _is_recoverable_session_error(parsed: object) -> bool:
+    """True if a parsed JSON-RPC body is a -32001 recoverable-session error."""
+    if not isinstance(parsed, dict):
+        return False
+    err = parsed.get("error")
+    if not isinstance(err, dict):
+        return False
+    if err.get("code") != _SESSION_EXPIRED_CODE:
+        return False
+    data = err.get("data")
+    return isinstance(data, dict) and bool(data.get("recoverable"))
 
 
 def http_post_once(
@@ -181,6 +215,54 @@ def http_post_once(
     return parse_sse_or_json(body), resp_session
 
 
+def _recover_and_replay(cfg: BridgeConfig, payload: dict[str, object], state: BridgeState) -> object | None:
+    """Re-initialize the HTTP session silently and replay the original payload.
+
+    Raises _RecoveryFailedError on any sub-step failure. Caller surfaces the
+    original -32001 error to the client when this raises.
+    """
+    if state.cached_init is None:
+        raise _RecoveryFailedError("no cached initialize payload")
+
+    state.clear_session(debug=cfg.debug)
+    internal_init = dict(state.cached_init)
+    internal_init["id"] = f"_bridge_reinit_{state.generation}"
+
+    try:
+        init_result, init_session = http_post_once(cfg, internal_init, None)
+    except (HttpMcpError, OSError, ValueError) as e:
+        raise _RecoveryFailedError(f"reinit POST failed: {e}") from e
+
+    if isinstance(init_result, dict) and "error" in init_result:
+        raise _RecoveryFailedError("reinit returned JSON-RPC error")
+
+    if init_session:
+        state.set_session(init_session, debug=cfg.debug)
+
+    # notifications/initialized \u2014 non-fatal if it errors; some servers don't require it.
+    with contextlib.suppress(HttpMcpError, OSError, ValueError):
+        http_post_once(
+            cfg,
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            state.session_id,
+        )
+
+    if cfg.debug:
+        print(
+            f"mcp-stdio-bridge: silent reinit succeeded generation={state.generation}",
+            file=sys.stderr,
+        )
+
+    try:
+        result, resp_session = http_post_once(cfg, payload, state.session_id)
+    except (HttpMcpError, OSError, ValueError) as e:
+        raise _RecoveryFailedError(f"replay POST failed: {e}") from e
+
+    if resp_session:
+        state.set_session(resp_session, debug=cfg.debug)
+    return result
+
+
 def http_post(
     cfg: BridgeConfig,
     payload: dict[str, object],
@@ -189,13 +271,13 @@ def http_post(
     method = str(payload.get("method", ""))
     if method == "initialize":
         state.clear_session(debug=cfg.debug)
+        state.cached_init = dict(payload)
 
     session_sent = state.session_id is not None
     try:
         result, resp_session = http_post_once(cfg, payload, state.session_id)
         if resp_session:
             state.set_session(resp_session, debug=cfg.debug)
-        return result
     except HttpMcpError as err:
         if not is_stale_session_failure(err, session_sent):
             raise
@@ -211,7 +293,26 @@ def http_post(
         result, resp_session = http_post_once(cfg, payload, None)
         if resp_session:
             state.set_session(resp_session, debug=cfg.debug)
-        return result
+
+    # In-band recovery: HTTP 200 envelope with JSON-RPC -32001 + recoverable=true.
+    # Server returns this when its session has expired but the transport still
+    # works; transparently re-initialize and replay so the client never sees it.
+    if cfg.recover_stale_session and method != "initialize" and _is_recoverable_session_error(result):
+        if cfg.debug:
+            print(
+                f"mcp-stdio-bridge: in-band -32001 recoverable error method={method} generation={state.generation}",
+                file=sys.stderr,
+            )
+        try:
+            return _recover_and_replay(cfg, payload, state)
+        except _RecoveryFailedError as e:
+            if cfg.debug:
+                print(
+                    f"mcp-stdio-bridge: silent reinit failed ({e}); surfacing original -32001",
+                    file=sys.stderr,
+                )
+
+    return result
 
 
 def run(argv: list[str] | None = None) -> None:
@@ -222,6 +323,7 @@ def run(argv: list[str] | None = None) -> None:
         ctx=build_ssl_context(args.ca_file),
         timeout=args.timeout,
         debug=args.debug,
+        recover_stale_session=args.recover_stale_session,
     )
     state = BridgeState()
 

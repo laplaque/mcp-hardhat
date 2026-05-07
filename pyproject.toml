@@ -14,6 +14,7 @@ dev = [
     "pytest>=9.0",
     "mypy>=1.8",
     "ruff>=0.3",
+    "pytest-cov>=7.1.0",
 ]
 
 [build-system]
@@ -33,6 +34,9 @@ line-length = 120
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "A", "SIM", "TC", "PLR"]
+
+[tool.ruff.lint.pylint]
+max-args = 7
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["PLR2004", "TC003"]
