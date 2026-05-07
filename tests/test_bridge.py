@@ -652,3 +652,328 @@ class TestRun:
             argv=["https://test/mcp", "--debug"],
         )
         assert "session updated" in stderr
+
+
+# ---------------------------------------------------------------------------
+# New tests: BridgeState cached_init
+# ---------------------------------------------------------------------------
+
+
+class TestBridgeStateCachedInit:
+    def test_default_none(self) -> None:
+        state = bridge.BridgeState()
+        assert state.cached_init is None
+
+
+# ---------------------------------------------------------------------------
+# New tests: BridgeConfig recover_stale_session
+# ---------------------------------------------------------------------------
+
+
+class TestBridgeConfigRecoverFlag:
+    def test_default_true(self) -> None:
+        cfg = bridge.BridgeConfig("https://x", {}, ssl.create_default_context(), 30.0)
+        assert cfg.recover_stale_session is True
+
+    def test_explicit_false(self) -> None:
+        cfg = bridge.BridgeConfig(
+            "https://x", {}, ssl.create_default_context(), 30.0,
+            recover_stale_session=False,
+        )
+        assert cfg.recover_stale_session is False
+
+
+# ---------------------------------------------------------------------------
+# New tests: --recover-stale-session CLI flag
+# ---------------------------------------------------------------------------
+
+
+class TestParseArgsRecoverFlag:
+    def test_default_true(self) -> None:
+        args = bridge.parse_args(["https://x"])
+        assert args.recover_stale_session is True
+
+    def test_explicit_no(self) -> None:
+        args = bridge.parse_args(["https://x", "--no-recover-stale-session"])
+        assert args.recover_stale_session is False
+
+    def test_explicit_yes(self) -> None:
+        args = bridge.parse_args(["https://x", "--recover-stale-session"])
+        assert args.recover_stale_session is True
+
+
+# ---------------------------------------------------------------------------
+# New tests: _is_recoverable_session_error
+# ---------------------------------------------------------------------------
+
+
+class TestIsRecoverableSessionError:
+    def test_recoverable_true(self) -> None:
+        body = {
+            "jsonrpc": "2.0", "id": 3,
+            "error": {
+                "code": -32001,
+                "message": "MCP session expired or unknown",
+                "data": {"recoverable": True, "retry": "initialize"},
+            },
+        }
+        assert bridge._is_recoverable_session_error(body) is True
+
+    def test_recoverable_false(self) -> None:
+        body = {
+            "jsonrpc": "2.0", "id": 3,
+            "error": {"code": -32001, "data": {"recoverable": False}},
+        }
+        assert bridge._is_recoverable_session_error(body) is False
+
+    def test_no_data_field(self) -> None:
+        body = {"error": {"code": -32001, "message": "x"}}
+        assert bridge._is_recoverable_session_error(body) is False
+
+    def test_wrong_code(self) -> None:
+        body = {"error": {"code": -32000, "data": {"recoverable": True}}}
+        assert bridge._is_recoverable_session_error(body) is False
+
+    def test_no_error_field(self) -> None:
+        body = {"jsonrpc": "2.0", "id": 1, "result": {"ok": True}}
+        assert bridge._is_recoverable_session_error(body) is False
+
+    def test_non_dict(self) -> None:
+        assert bridge._is_recoverable_session_error(None) is False
+        assert bridge._is_recoverable_session_error("string") is False
+        assert bridge._is_recoverable_session_error([1, 2, 3]) is False
+
+    def test_data_not_dict(self) -> None:
+        body = {"error": {"code": -32001, "data": "string"}}
+        assert bridge._is_recoverable_session_error(body) is False
+
+
+# ---------------------------------------------------------------------------
+# New tests: in-band recovery in http_post + run()
+# ---------------------------------------------------------------------------
+
+
+_RECOVERABLE_ERROR_BODY = json.dumps({
+    "jsonrpc": "2.0", "id": 99,
+    "error": {
+        "code": -32001,
+        "message": "MCP session expired or unknown",
+        "data": {"recoverable": True, "retry": "initialize", "sessionId": "old"},
+    },
+})
+
+_INIT_PAYLOAD: dict[str, object] = {
+    "jsonrpc": "2.0", "id": 0, "method": "initialize",
+    "params": {
+        "protocolVersion": "2025-11-25",
+        "capabilities": {},
+        "clientInfo": {"name": "test-client", "version": "0.1.0"},
+    },
+}
+
+
+class TestInBandRecovery:
+    CFG = bridge.BridgeConfig("https://test/mcp", {}, ssl.create_default_context(), 30.0)
+    CFG_DEBUG = bridge.BridgeConfig(
+        "https://test/mcp", {}, ssl.create_default_context(), 30.0, debug=True
+    )
+    CFG_NO_RECOVER = bridge.BridgeConfig(
+        "https://test/mcp", {}, ssl.create_default_context(), 30.0,
+        recover_stale_session=False,
+    )
+
+    def _state_with_cached_init(self) -> Any:
+        state = bridge.BridgeState()
+        state.cached_init = dict(_INIT_PAYLOAD)
+        state.set_session("stale-sess")
+        return state
+
+    def test_initialize_caches_payload(self) -> None:
+        state = bridge.BridgeState()
+        resp = _make_response('{"result":"ok"}', session_id="s1")
+        with patch("urllib.request.urlopen", return_value=resp):
+            bridge.http_post(self.CFG, dict(_INIT_PAYLOAD), state)
+        assert state.cached_init is not None
+        assert state.cached_init["method"] == "initialize"
+
+    def test_recoverable_error_triggers_silent_reinit(self) -> None:
+        state = self._state_with_cached_init()
+        stale_resp = _make_response(_RECOVERABLE_ERROR_BODY)
+        init_resp = _make_response(
+            '{"jsonrpc":"2.0","id":"_bridge_reinit_2","result":{}}', session_id="fresh"
+        )
+        notif_resp = _make_response("")
+        replay_resp = _make_response(
+            '{"jsonrpc":"2.0","id":99,"result":{"recovered":true}}', session_id="fresh"
+        )
+        responses: list[Any] = [stale_resp, init_resp, notif_resp, replay_resp]
+
+        def side_effect(req: Any, **kw: Any) -> Any:
+            return responses.pop(0)
+
+        with patch("urllib.request.urlopen", side_effect=side_effect):
+            result = bridge.http_post(
+                self.CFG, {"jsonrpc": "2.0", "id": 99, "method": "tools/call"}, state
+            )
+
+        assert result == {"jsonrpc": "2.0", "id": 99, "result": {"recovered": True}}
+        assert state.session_id == "fresh"
+
+    def test_recovery_disabled_passes_through(self) -> None:
+        state = self._state_with_cached_init()
+        stale_resp = _make_response(_RECOVERABLE_ERROR_BODY)
+        with patch("urllib.request.urlopen", return_value=stale_resp) as mock_open:
+            result = bridge.http_post(
+                self.CFG_NO_RECOVER,
+                {"jsonrpc": "2.0", "id": 99, "method": "tools/call"},
+                state,
+            )
+        assert mock_open.call_count == 1
+        assert isinstance(result, dict)
+        assert result["error"]["code"] == -32001
+
+    def test_initialize_method_does_not_trigger_recovery(self) -> None:
+        state = bridge.BridgeState()
+        stale_resp = _make_response(_RECOVERABLE_ERROR_BODY)
+        with patch("urllib.request.urlopen", return_value=stale_resp) as mock_open:
+            result = bridge.http_post(self.CFG, dict(_INIT_PAYLOAD), state)
+        assert mock_open.call_count == 1
+        assert isinstance(result, dict)
+        assert result["error"]["code"] == -32001
+
+    def test_reinit_post_failure_surfaces_original_error(self) -> None:
+        state = self._state_with_cached_init()
+        stale_resp = _make_response(_RECOVERABLE_ERROR_BODY)
+        reinit_err = _make_http_error(503, "service unavailable")
+        responses: list[Any] = [stale_resp, reinit_err]
+
+        def side_effect(req: Any, **kw: Any) -> Any:
+            val = responses.pop(0)
+            if isinstance(val, Exception):
+                raise val
+            return val
+
+        with patch("urllib.request.urlopen", side_effect=side_effect):
+            result = bridge.http_post(
+                self.CFG, {"jsonrpc": "2.0", "id": 99, "method": "tools/call"}, state
+            )
+        assert isinstance(result, dict)
+        assert result["error"]["code"] == -32001
+
+    def test_reinit_returns_jsonrpc_error_surfaces_original(self) -> None:
+        state = self._state_with_cached_init()
+        stale_resp = _make_response(_RECOVERABLE_ERROR_BODY)
+        init_error_resp = _make_response(
+            '{"jsonrpc":"2.0","id":"_bridge_reinit_2","error":{"code":-32600,"message":"invalid params"}}'
+        )
+        responses: list[Any] = [stale_resp, init_error_resp]
+
+        def side_effect(req: Any, **kw: Any) -> Any:
+            return responses.pop(0)
+
+        with patch("urllib.request.urlopen", side_effect=side_effect):
+            result = bridge.http_post(
+                self.CFG, {"jsonrpc": "2.0", "id": 99, "method": "tools/call"}, state
+            )
+        assert isinstance(result, dict)
+        assert result["error"]["code"] == -32001
+
+    def test_replay_failure_surfaces_original(self) -> None:
+        state = self._state_with_cached_init()
+        stale_resp = _make_response(_RECOVERABLE_ERROR_BODY)
+        init_resp = _make_response(
+            '{"jsonrpc":"2.0","id":"_bridge_reinit_2","result":{}}', session_id="fresh"
+        )
+        notif_resp = _make_response("")
+        replay_err = _make_http_error(500, "server error")
+        responses: list[Any] = [stale_resp, init_resp, notif_resp, replay_err]
+
+        def side_effect(req: Any, **kw: Any) -> Any:
+            val = responses.pop(0)
+            if isinstance(val, Exception):
+                raise val
+            return val
+
+        with patch("urllib.request.urlopen", side_effect=side_effect):
+            result = bridge.http_post(
+                self.CFG, {"jsonrpc": "2.0", "id": 99, "method": "tools/call"}, state
+            )
+        assert isinstance(result, dict)
+        assert result["error"]["code"] == -32001
+
+    def test_notification_initialized_failure_does_not_block_replay(self) -> None:
+        state = self._state_with_cached_init()
+        stale_resp = _make_response(_RECOVERABLE_ERROR_BODY)
+        init_resp = _make_response(
+            '{"jsonrpc":"2.0","id":"_bridge_reinit_2","result":{}}', session_id="fresh"
+        )
+        notif_err = _make_http_error(404, "not found")
+        replay_resp = _make_response(
+            '{"jsonrpc":"2.0","id":99,"result":{"ok":true}}', session_id="fresh"
+        )
+        responses: list[Any] = [stale_resp, init_resp, notif_err, replay_resp]
+
+        def side_effect(req: Any, **kw: Any) -> Any:
+            val = responses.pop(0)
+            if isinstance(val, Exception):
+                raise val
+            return val
+
+        with patch("urllib.request.urlopen", side_effect=side_effect):
+            result = bridge.http_post(
+                self.CFG, {"jsonrpc": "2.0", "id": 99, "method": "tools/call"}, state
+            )
+        assert isinstance(result, dict)
+        assert result["result"] == {"ok": True}
+
+    def test_no_cached_init_surfaces_original(self) -> None:
+        state = bridge.BridgeState()
+        state.set_session("stale")
+        # cached_init left as None
+        stale_resp = _make_response(_RECOVERABLE_ERROR_BODY)
+        with patch("urllib.request.urlopen", return_value=stale_resp) as mock_open:
+            result = bridge.http_post(
+                self.CFG, {"jsonrpc": "2.0", "id": 99, "method": "tools/call"}, state
+            )
+        assert mock_open.call_count == 1
+        assert isinstance(result, dict)
+        assert result["error"]["code"] == -32001
+
+    def test_run_integration_recovers_silently(self) -> None:
+        """Full stdin -> stdout integration: client never sees the -32001."""
+        import io as _io
+
+        init_resp = _make_response('{"jsonrpc":"2.0","id":0,"result":{}}', session_id="s1")
+        stale_resp = _make_response(_RECOVERABLE_ERROR_BODY)
+        reinit_resp = _make_response(
+            '{"jsonrpc":"2.0","id":"_bridge_reinit_2","result":{}}', session_id="s2"
+        )
+        notif_resp = _make_response("")
+        replay_resp = _make_response(
+            '{"jsonrpc":"2.0","id":99,"result":{"recovered":true}}', session_id="s2"
+        )
+        responses: list[Any] = [init_resp, stale_resp, reinit_resp, notif_resp, replay_resp]
+
+        def side_effect(req: Any, **kw: Any) -> Any:
+            return responses.pop(0)
+
+        stdin_text = (
+            json.dumps(_INIT_PAYLOAD)
+            + "\n"
+            + json.dumps({"jsonrpc": "2.0", "id": 99, "method": "tools/call"})
+            + "\n"
+        )
+        with (
+            patch("sys.stdin", _io.StringIO(stdin_text)),
+            patch("urllib.request.urlopen", side_effect=side_effect),
+            patch("sys.stdout", new_callable=_io.StringIO) as mock_stdout,
+        ):
+            bridge.run(["https://test/mcp"])
+
+        lines = [json.loads(line) for line in mock_stdout.getvalue().strip().split("\n") if line]
+        # Two visible responses: initialize result, and recovered tools/call result.
+        # The -32001 is silently swallowed by recovery.
+        assert len(lines) == 2
+        assert lines[1] == {"jsonrpc": "2.0", "id": 99, "result": {"recovered": True}}
+        for line in lines:
+            assert "error" not in line or line.get("error", {}).get("code") != -32001
