@@ -110,7 +110,7 @@ def write_jsonrpc_error(request_id: object, code: int, message: str) -> None:
 
 
 class BridgeConfig:
-    def __init__(  # noqa: PLR0913
+    def __init__(
         self,
         url: str,
         headers: dict[str, str],
