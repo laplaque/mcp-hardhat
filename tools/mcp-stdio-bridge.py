@@ -215,9 +215,7 @@ def http_post_once(
     return parse_sse_or_json(body), resp_session
 
 
-def _recover_and_replay(
-    cfg: BridgeConfig, payload: dict[str, object], state: BridgeState
-) -> object | None:
+def _recover_and_replay(cfg: BridgeConfig, payload: dict[str, object], state: BridgeState) -> object | None:
     """Re-initialize the HTTP session silently and replay the original payload.
 
     Raises _RecoveryFailedError on any sub-step failure. Caller surfaces the
@@ -241,7 +239,7 @@ def _recover_and_replay(
     if init_session:
         state.set_session(init_session, debug=cfg.debug)
 
-    # notifications/initialized — non-fatal if it errors; some servers don't require it.
+    # notifications/initialized \u2014 non-fatal if it errors; some servers don't require it.
     with contextlib.suppress(HttpMcpError, OSError, ValueError):
         http_post_once(
             cfg,
@@ -299,15 +297,10 @@ def http_post(
     # In-band recovery: HTTP 200 envelope with JSON-RPC -32001 + recoverable=true.
     # Server returns this when its session has expired but the transport still
     # works; transparently re-initialize and replay so the client never sees it.
-    if (
-        cfg.recover_stale_session
-        and method != "initialize"
-        and _is_recoverable_session_error(result)
-    ):
+    if cfg.recover_stale_session and method != "initialize" and _is_recoverable_session_error(result):
         if cfg.debug:
             print(
-                f"mcp-stdio-bridge: in-band -32001 recoverable error method={method}"
-                f" generation={state.generation}",
+                f"mcp-stdio-bridge: in-band -32001 recoverable error method={method} generation={state.generation}",
                 file=sys.stderr,
             )
         try:
