@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import ssl
@@ -109,7 +110,7 @@ def write_jsonrpc_error(request_id: object, code: int, message: str) -> None:
 
 
 class BridgeConfig:
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         url: str,
         headers: dict[str, str],
@@ -154,9 +155,11 @@ class HttpMcpError(Exception):
         super().__init__(f"HTTP {status} on {method}")
 
 
-class _RecoveryFailed(Exception):
+class _RecoveryFailedError(Exception):
     """Internal: silent re-init flow could not complete."""
 
+
+_SESSION_EXPIRED_CODE = -32001
 
 _STALE_SESSION_TERMS = ("session", "expired", "unknown", "invalid", "not found", "stale", "mcp-session-id")
 
@@ -183,7 +186,7 @@ def _is_recoverable_session_error(parsed: object) -> bool:
     err = parsed.get("error")
     if not isinstance(err, dict):
         return False
-    if err.get("code") != -32001:
+    if err.get("code") != _SESSION_EXPIRED_CODE:
         return False
     data = err.get("data")
     return isinstance(data, dict) and bool(data.get("recoverable"))
@@ -217,11 +220,11 @@ def _recover_and_replay(
 ) -> object | None:
     """Re-initialize the HTTP session silently and replay the original payload.
 
-    Raises _RecoveryFailed on any sub-step failure. Caller surfaces the
+    Raises _RecoveryFailedError on any sub-step failure. Caller surfaces the
     original -32001 error to the client when this raises.
     """
     if state.cached_init is None:
-        raise _RecoveryFailed("no cached initialize payload")
+        raise _RecoveryFailedError("no cached initialize payload")
 
     state.clear_session(debug=cfg.debug)
     internal_init = dict(state.cached_init)
@@ -230,23 +233,21 @@ def _recover_and_replay(
     try:
         init_result, init_session = http_post_once(cfg, internal_init, None)
     except (HttpMcpError, OSError, ValueError) as e:
-        raise _RecoveryFailed(f"reinit POST failed: {e}") from e
+        raise _RecoveryFailedError(f"reinit POST failed: {e}") from e
 
     if isinstance(init_result, dict) and "error" in init_result:
-        raise _RecoveryFailed("reinit returned JSON-RPC error")
+        raise _RecoveryFailedError("reinit returned JSON-RPC error")
 
     if init_session:
         state.set_session(init_session, debug=cfg.debug)
 
     # notifications/initialized — non-fatal if it errors; some servers don't require it.
-    try:
+    with contextlib.suppress(HttpMcpError, OSError, ValueError):
         http_post_once(
             cfg,
             {"jsonrpc": "2.0", "method": "notifications/initialized"},
             state.session_id,
         )
-    except (HttpMcpError, OSError, ValueError):
-        pass
 
     if cfg.debug:
         print(
@@ -257,7 +258,7 @@ def _recover_and_replay(
     try:
         result, resp_session = http_post_once(cfg, payload, state.session_id)
     except (HttpMcpError, OSError, ValueError) as e:
-        raise _RecoveryFailed(f"replay POST failed: {e}") from e
+        raise _RecoveryFailedError(f"replay POST failed: {e}") from e
 
     if resp_session:
         state.set_session(resp_session, debug=cfg.debug)
@@ -311,7 +312,7 @@ def http_post(
             )
         try:
             return _recover_and_replay(cfg, payload, state)
-        except _RecoveryFailed as e:
+        except _RecoveryFailedError as e:
             if cfg.debug:
                 print(
                     f"mcp-stdio-bridge: silent reinit failed ({e}); surfacing original -32001",
